@@ -1,0 +1,3 @@
+- insert:
+    - id: pomodoro-timer
+      name: '@local/pomodoro-timer'

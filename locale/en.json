@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Pomodoro timer",
+    "description": "A floating focus timer in the corner of the window, with configurable focus and break lengths."
+  }
+}

@@ -41,6 +41,17 @@ window.__ModuleLoader__.load({
       sound: true,
     };
 
+    /* Two minutes of synthesized ambient music; no audio assets are shipped. */
+    const MUSIC_MS = 120000;
+    const CHORD_MS = 15000;
+    const CHORDS = [
+      [48, 55, 64, 71],
+      [45, 52, 60, 67],
+      [41, 48, 57, 64],
+      [43, 50, 59, 64],
+    ];
+    const ARP_PATTERN = [0, 2, 1, 3, 2, 1, 0, 2, 3, 1, 2, 0];
+
     const DICT = {
       en: {
         label: 'Pomodoro timer',
@@ -61,7 +72,9 @@ window.__ModuleLoader__.load({
         options: 'Options',
         minutes: '{value} min',
         autoStart: 'Start the next session automatically',
-        sound: 'Play a sound when a session ends',
+        sound: 'Play two minutes of gentle music at each phase end',
+        musicPlaying: 'Gentle music playing',
+        stopMusic: 'Stop',
         focusFinished: 'Focus finished — take a break',
         breakFinished: 'Break over — back to focus',
         decrease: 'Decrease',
@@ -86,7 +99,9 @@ window.__ModuleLoader__.load({
         options: '选项',
         minutes: '{value} 分钟',
         autoStart: '自动开始下一段',
-        sound: '阶段结束时播放提示音',
+        sound: '阶段结束时播放 2 分钟轻音乐',
+        musicPlaying: '轻音乐播放中',
+        stopMusic: '停止',
         focusFinished: '专注结束，休息一下',
         breakFinished: '休息结束，继续专注',
         decrease: '减少',
@@ -103,6 +118,9 @@ window.__ModuleLoader__.load({
     let persistTimer = 0;
     let unsubscribePersist = null;
     let audio = null;
+    let musicBus = null;
+    let musicScheduler = 0;
+    let musicTimer = 0;
 
     function clamp(value, min, max) {
       return Math.min(max, Math.max(min, value));
@@ -208,6 +226,7 @@ window.__ModuleLoader__.load({
         expanded: Boolean(saved && saved.expanded),
         view: 'timer',
         notice: null,
+        music: false,
       };
     }
 
@@ -263,29 +282,153 @@ window.__ModuleLoader__.load({
       if (document.visibilityState === 'visible') tick();
     }
 
-    function playChime() {
+    /* --------------------------------------------------------------- audio */
+
+    function midiToFreq(midi) {
+      return 440 * Math.pow(2, (midi - 69) / 12);
+    }
+
+    function ensureAudio() {
       const AudioCtor = window.AudioContext || window.webkitAudioContext;
-      if (!AudioCtor) return;
-      try {
-        audio = audio || new AudioCtor();
-        const now = audio.currentTime;
-        [660, 990].forEach((frequency, index) => {
-          const oscillator = audio.createOscillator();
-          const gain = audio.createGain();
-          const start = now + index * 0.18;
-          oscillator.type = 'sine';
-          oscillator.frequency.value = frequency;
-          gain.gain.setValueAtTime(0.0001, start);
-          gain.gain.exponentialRampToValueAtTime(0.16, start + 0.02);
-          gain.gain.exponentialRampToValueAtTime(0.0001, start + 0.34);
-          oscillator.connect(gain);
-          gain.connect(audio.destination);
-          oscillator.start(start);
-          oscillator.stop(start + 0.36);
-        });
-      } catch (error) {
-        /* audio is a nicety; never let it break the state machine */
+      if (!AudioCtor) return null;
+      if (!audio) {
+        try {
+          audio = new AudioCtor();
+        } catch (error) {
+          return null;
+        }
       }
+      if (audio.state === 'suspended' && typeof audio.resume === 'function') {
+        Promise.resolve(audio.resume()).catch(() => {});
+      }
+      return audio;
+    }
+
+    function makeReverb(ac) {
+      const seconds = 2.6;
+      const length = Math.max(1, Math.floor(ac.sampleRate * seconds));
+      const buffer = ac.createBuffer(2, length, ac.sampleRate);
+      for (let channel = 0; channel < 2; channel += 1) {
+        const data = buffer.getChannelData(channel);
+        for (let i = 0; i < length; i += 1) {
+          data[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / length, 2.6);
+        }
+      }
+      const convolver = ac.createConvolver();
+      convolver.buffer = buffer;
+      return convolver;
+    }
+
+    function createMusicBus(ac) {
+      const bus = ac.createGain();
+      bus.gain.value = 0;
+      const filter = ac.createBiquadFilter();
+      filter.type = 'lowpass';
+      filter.frequency.value = 2600;
+      const dry = ac.createGain();
+      dry.gain.value = 0.85;
+      const wet = ac.createGain();
+      wet.gain.value = 0.4;
+      const reverb = makeReverb(ac);
+      bus.connect(filter);
+      filter.connect(dry);
+      dry.connect(ac.destination);
+      filter.connect(reverb);
+      reverb.connect(wet);
+      wet.connect(ac.destination);
+      return bus;
+    }
+
+    function scheduleNote(ac, bus, midi, at, duration, peak, type, attack) {
+      const osc = ac.createOscillator();
+      const gain = ac.createGain();
+      const rise = attack || 0.03;
+      osc.type = type || 'triangle';
+      osc.frequency.setValueAtTime(midiToFreq(midi), at);
+      gain.gain.setValueAtTime(0.0001, at);
+      gain.gain.linearRampToValueAtTime(peak, at + rise);
+      gain.gain.setValueAtTime(peak, at + Math.max(rise, duration - 0.35));
+      gain.gain.exponentialRampToValueAtTime(0.0001, at + duration);
+      osc.connect(gain);
+      gain.connect(bus);
+      osc.start(at);
+      osc.stop(at + duration + 0.1);
+    }
+
+    function scheduleChord(ac, bus, index, at, duration) {
+      const chord = CHORDS[index % CHORDS.length];
+      chord.forEach((midi) => scheduleNote(ac, bus, midi, at, duration, 0.03, 'triangle', 4));
+      scheduleNote(ac, bus, chord[0] - 12, at, duration, 0.045, 'sine', 3);
+      const step = duration / ARP_PATTERN.length;
+      ARP_PATTERN.forEach((tone, position) => {
+        scheduleNote(ac, bus, chord[tone] + 12, at + position * step, Math.max(0.9, step * 1.3), 0.05, 'sine', 0.02);
+      });
+    }
+
+    function startMusic() {
+      const ac = ensureAudio();
+      if (!ac) return;
+      stopMusic(true);
+
+      const bus = createMusicBus(ac);
+      musicBus = bus;
+      const startedAt = ac.currentTime + 0.2;
+      const until = startedAt + MUSIC_MS / 1000;
+      try {
+        bus.gain.setValueAtTime(0.0001, startedAt);
+        bus.gain.linearRampToValueAtTime(0.8, startedAt + 2.5);
+        bus.gain.setValueAtTime(0.8, Math.max(startedAt + 2.5, until - 5));
+        bus.gain.linearRampToValueAtTime(0.0001, until);
+      } catch (error) {
+        /* automation support is optional */
+      }
+
+      let chordIndex = 0;
+      let nextAt = startedAt;
+      const scheduleNext = () => {
+        const horizon = ac.currentTime + 3;
+        while (nextAt < horizon && nextAt < until) {
+          scheduleChord(ac, bus, chordIndex, nextAt, CHORD_MS / 1000);
+          nextAt += CHORD_MS / 1000;
+          chordIndex += 1;
+        }
+      };
+      scheduleNext();
+      musicScheduler = window.setInterval(scheduleNext, 800);
+      musicTimer = window.setTimeout(() => stopMusic(false), MUSIC_MS + 200);
+      store.set({ music: true });
+    }
+
+    function stopMusic(instant) {
+      if (musicScheduler) {
+        window.clearInterval(musicScheduler);
+        musicScheduler = 0;
+      }
+      if (musicTimer) {
+        window.clearTimeout(musicTimer);
+        musicTimer = 0;
+      }
+      const bus = musicBus;
+      musicBus = null;
+      if (bus && audio) {
+        try {
+          const now = audio.currentTime;
+          bus.gain.cancelScheduledValues(now);
+          bus.gain.setValueAtTime(Math.max(bus.gain.value, 0.0001), now);
+          if (instant === true) bus.gain.setValueAtTime(0.0001, now);
+          else bus.gain.exponentialRampToValueAtTime(0.0001, now + 1.2);
+        } catch (error) {
+          /* automation support is optional */
+        }
+        window.setTimeout(() => {
+          try {
+            bus.disconnect();
+          } catch (error) {
+            /* already gone */
+          }
+        }, instant === true ? 40 : 1400);
+      }
+      if (store && store.get().music) store.set({ music: false });
     }
 
     function clearNoticeSoon() {
@@ -326,7 +469,7 @@ window.__ModuleLoader__.load({
       });
       if (silent) return;
       clearNoticeSoon();
-      if (settings.sound) playChime();
+      if (settings.sound) startMusic();
     }
 
     /* -------------------------------------------------------------- actions */
@@ -522,6 +665,21 @@ window.__ModuleLoader__.load({
           t(state.notice === 'break' ? 'focusFinished' : 'breakFinished'))
         : null;
 
+      const musicChip = state.music
+        ? h('div', { key: 'music', className: 'pomo-music', role: 'status' },
+          h('span', { className: 'pomo-eq', 'aria-hidden': 'true' },
+            h('i', { key: 'a' }), h('i', { key: 'b' }), h('i', { key: 'c' })),
+          h('span', { className: 'pomo-music-text' }, t('musicPlaying')),
+          h('button', {
+            type: 'button',
+            className: 'pomo-music-stop',
+            title: t('stopMusic'),
+            'aria-label': t('stopMusic'),
+            onClick: () => stopMusic(false),
+          }, t('stopMusic')),
+        )
+        : null;
+
       const pill = h('button', {
         key: 'pill',
         type: 'button',
@@ -688,13 +846,16 @@ window.__ModuleLoader__.load({
         },
       }, header, state.view === 'settings' ? settingsView : timerView);
 
-      return h('div', { className: 'pomo-root' }, root, notice, collapsed ? pill : card);
+      return h('div', {
+        className: 'pomo-root',
+        onPointerDown: () => ensureAudio(),
+      }, root, collapsed ? pill : card, notice, musicChip);
     }
 
     /* ------------------------------------------------------------------ CSS */
 
     const CSS = `
-.pomo-root{position:fixed;right:16px;bottom:16px;z-index:70;display:flex;flex-direction:column;align-items:flex-end;gap:8px;pointer-events:none;font-size:13px;line-height:1.4;color:var(--dsw-alias-label-primary);-webkit-font-smoothing:antialiased}
+.pomo-root{position:fixed;right:16px;top:16px;z-index:70;display:flex;flex-direction:column;align-items:flex-end;gap:8px;pointer-events:none;font-size:13px;line-height:1.4;color:var(--dsw-alias-label-primary);-webkit-font-smoothing:antialiased}
 .pomo-root *{box-sizing:border-box;font-family:inherit}
 .pomo-pill{pointer-events:auto;display:flex;align-items:center;gap:8px;padding:6px 12px 6px 8px;border-radius:999px;border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-overlay);color:inherit;cursor:pointer;font:inherit;box-shadow:0 6px 20px rgba(0,0,0,.16);transition:border-color .15s ease,box-shadow .15s ease}
 .pomo-pill:hover{border-color:var(--dsw-alias-border-l2);box-shadow:0 8px 24px rgba(0,0,0,.2)}
@@ -740,6 +901,17 @@ window.__ModuleLoader__.load({
 .pomo-switch[aria-checked="true"] .pomo-knob{transform:translateX(14px);background:var(--dsw-alias-bg-base)}
 .pomo-notice{pointer-events:none;max-width:240px;padding:8px 12px;border-radius:12px;border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-overlay);color:var(--dsw-alias-label-primary);font-size:12px;box-shadow:0 10px 28px rgba(0,0,0,.18);animation:pomo-notice-in .2s ease-out}
 @keyframes pomo-notice-in{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
+.pomo-music{pointer-events:auto;display:flex;align-items:center;gap:8px;padding:6px 8px 6px 12px;border-radius:12px;border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-overlay);color:var(--dsw-alias-label-primary);font-size:12px;box-shadow:0 10px 28px rgba(0,0,0,.18);animation:pomo-notice-in .2s ease-out}
+.pomo-eq{display:flex;align-items:flex-end;gap:2px;height:12px;transform-origin:bottom}
+.pomo-eq i{display:block;width:2.5px;border-radius:2px;background:var(--dsw-alias-brand-primary);transform-origin:bottom;animation:pomo-eq 1s ease-in-out infinite}
+.pomo-eq i:nth-child(1){height:6px;animation-delay:-.2s}
+.pomo-eq i:nth-child(2){height:11px;animation-delay:-.5s}
+.pomo-eq i:nth-child(3){height:8px;animation-delay:-.8s}
+@keyframes pomo-eq{0%,100%{transform:scaleY(.45)}50%{transform:scaleY(1)}}
+.pomo-music-text{white-space:nowrap}
+.pomo-music-stop{flex:none;height:22px;padding:0 9px;border:1px solid var(--dsw-alias-border-l1);border-radius:999px;background:transparent;color:var(--dsw-alias-label-secondary);font:inherit;font-size:11.5px;cursor:pointer}
+.pomo-music-stop:hover{color:var(--dsw-alias-label-primary);border-color:var(--dsw-alias-border-l2)}
+.pomo-music-stop:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:1px}
 `;
 
     /* ------------------------------------------------------------------ run */
@@ -790,6 +962,7 @@ window.__ModuleLoader__.load({
               unsubscribePersist = null;
             }
             document.removeEventListener('visibilitychange', onVisibilityChange);
+            stopMusic(true);
             save();
           };
         }, 'pomodoro engine');
